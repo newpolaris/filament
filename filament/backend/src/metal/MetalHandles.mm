@@ -366,9 +366,10 @@ void MetalTexture::loadCubeImage(const PixelBufferDescriptor& data, const FaceOf
 }
 
 MetalRenderTarget::MetalRenderTarget(MetalContext* context, uint32_t width, uint32_t height,
-        uint8_t samples, TextureFormat format, id<MTLTexture> color, id<MTLTexture> depth)
+        uint8_t samples, TextureFormat format, id<MTLTexture> color, id<MTLTexture> depth,
+        uint8_t level)
         : HwRenderTarget(width, height), context(context), color(color), depth(depth),
-        samples(samples) {
+        samples(samples), level(level) {
     [color retain];
     [depth retain];
 

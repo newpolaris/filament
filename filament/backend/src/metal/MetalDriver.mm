@@ -58,6 +58,7 @@ MetalDriver::MetalDriver(backend::MetalPlatform* platform) noexcept
     mContext->depthStencilStateCache.setDevice(mContext->device);
     mContext->samplerStateCache.setDevice(mContext->device);
     mContext->bufferPool = new MetalBufferPool(*mContext);
+    mContext->blitter = new MetalBlitter(*mContext);
 
     CVReturn success = CVMetalTextureCacheCreate(kCFAllocatorDefault, nullptr, mContext->device,
             nullptr, &mContext->textureCache);
@@ -157,7 +158,16 @@ void MetalDriver::createRenderTargetR(Handle<HwRenderTarget> rth,
             auto colorTexture = handle_cast<MetalTexture>(mHandleMap, color.handle);
             return colorTexture->texture;
         } else if (targetBufferFlags & TargetBufferFlags::COLOR) {
-            ASSERT_POSTCONDITION(false, "A color buffer is required for a render target.");
+            ASSERT_POSTCONDITION(samples == 1,
+                    "The Metal backend does not support MSAA render targets without textures.");
+            MTLTextureDescriptor* colorTextureDesc =
+                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:getMetalFormat(format)
+                                                                       width:width
+                                                                      height:height
+                                                                   mipmapped:NO];
+            colorTextureDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            colorTextureDesc.resourceOptions = MTLResourceStorageModePrivate;
+            return [[mContext->device newTextureWithDescriptor:colorTextureDesc] autorelease];
         }
         return nil;
     };
@@ -167,12 +177,12 @@ void MetalDriver::createRenderTargetR(Handle<HwRenderTarget> rth,
             auto depthTexture = handle_cast<MetalTexture>(mHandleMap, depth.handle);
             return depthTexture->texture;
         } else if (targetBufferFlags & TargetBufferFlags::DEPTH) {
-            MTLTextureDescriptor *depthTextureDesc =
+            MTLTextureDescriptor* depthTextureDesc =
                     [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
                                                                        width:width
                                                                       height:height
                                                                    mipmapped:NO];
-            depthTextureDesc.usage = MTLTextureUsageRenderTarget;
+            depthTextureDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             depthTextureDesc.resourceOptions = MTLResourceStorageModePrivate;
             return [[mContext->device newTextureWithDescriptor:depthTextureDesc] autorelease];
         }
@@ -180,7 +190,7 @@ void MetalDriver::createRenderTargetR(Handle<HwRenderTarget> rth,
     };
 
     construct_handle<MetalRenderTarget>(mHandleMap, rth, mContext, width, height, samples, format,
-            getColorTexture(), getDepthTexture());
+            getColorTexture(), getDepthTexture(), color.level);
 
     ASSERT_POSTCONDITION(
             !stencil.handle && !(targetBufferFlags & TargetBufferFlags::STENCIL),
@@ -324,6 +334,7 @@ void MetalDriver::terminate() {
     [mContext->driverPool drain];
 
     MetalExternalImage::shutdown();
+    MetalBlitter::shutdown();
 }
 
 ShaderModel MetalDriver::getShaderModel() const noexcept {
@@ -634,7 +645,57 @@ void MetalDriver::blit(TargetBufferFlags buffers,
         Handle<HwRenderTarget> dst, backend::Viewport dstRect,
         Handle<HwRenderTarget> src, backend::Viewport srcRect,
         SamplerMagFilter filter) {
-    ASSERT_POSTCONDITION(false, "Blitting not implemented.");
+    ASSERT_PRECONDITION(mContext->currentCommandBuffer != nil &&
+                        mContext->currentCommandEncoder == nil,
+                        "Blitting must be done during a frame, but outside of a render pass.");
+
+    auto srcTarget = handle_cast<MetalRenderTarget>(mHandleMap, src);
+    auto dstTarget = handle_cast<MetalRenderTarget>(mHandleMap, dst);
+
+    ASSERT_PRECONDITION(srcRect.left >= 0 && srcRect.bottom >= 0 &&
+                        dstRect.left >= 0 && dstRect.bottom >= 0,
+            "Source and destination rects must be positive.");
+
+    id<MTLTexture> srcTexture = srcTarget->getColor();
+    id<MTLTexture> dstTexture = dstTarget->getColor();
+
+    // Metal's texture coordinates have (0, 0) at the top-left of the texture, but Filament's
+    // coordinates have (0, 0) at bottom-left.
+    MTLRegion srcRegion = MTLRegionMake2D(
+            (NSUInteger) srcRect.left,
+            srcTexture.height - (NSUInteger) srcRect.bottom - srcRect.height,
+            srcRect.width, srcRect.height);
+
+    MTLRegion dstRegion = MTLRegionMake2D(
+            (NSUInteger) dstRect.left,
+            dstTexture.height - (NSUInteger) dstRect.bottom - dstRect.height,
+            dstRect.width, dstRect.height);
+
+    const uint8_t srcLevel = srcTarget->getColorLevel();
+    const uint8_t dstLevel = dstTarget->getColorLevel();
+
+    ASSERT_PRECONDITION(srcTexture.textureType == MTLTextureType2D &&
+                        dstTexture.textureType == MTLTextureType2D,
+                        "Metal does not support blitting to/from non-2D textures.");
+
+    MetalBlitter::BlitArgs args;
+    args.filter = filter;
+    args.source.level = srcLevel;
+    args.source.region = srcRegion;
+    args.destination.level = dstLevel;
+    args.destination.region = dstRegion;
+
+    if (buffers & TargetBufferFlags::COLOR) {
+        args.source.color = srcTexture;
+        args.destination.color = dstTexture;
+    }
+
+    if (buffers & TargetBufferFlags::DEPTH) {
+        args.source.depth = srcTarget->getDepth();
+        args.destination.depth = dstTarget->getDepth();
+    }
+
+    mContext->blitter->blit(args);
 }
 
 void MetalDriver::draw(backend::PipelineState ps, Handle<HwRenderPrimitive> rph) {
